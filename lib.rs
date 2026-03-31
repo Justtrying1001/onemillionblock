@@ -119,6 +119,133 @@ pub mod one_million_block {
 
         Ok(())
     }
+
+    pub fn rebuy_pixel(
+        ctx: Context<RebuyPixel>,
+        new_name: String,
+        new_description: String,
+        new_image_data: Vec<u8>,
+        new_url: String,
+    ) -> Result<()> {
+        require!(
+            new_name.len() <= MAX_NAME_LEN,
+            ErrorCode::NameTooLong
+        );
+        require!(
+            new_description.len() <= MAX_DESCRIPTION_LEN,
+            ErrorCode::DescriptionTooLong
+        );
+        require!(
+            new_url.len() <= MAX_URL_LEN,
+            ErrorCode::UrlTooLong
+        );
+        require!(
+            new_image_data.len() <= MAX_IMAGE_DATA_LEN,
+            ErrorCode::ImageDataTooLarge
+        );
+
+        let pixel = &mut ctx.accounts.pixel;
+        let billboard = &mut ctx.accounts.billboard;
+        let signer = &ctx.accounts.signer;
+
+        require!(!pixel.locked, ErrorCode::PixelLocked);
+        require!(pixel.owner != signer.key(), ErrorCode::AlreadyOwner);
+
+        require_keys_eq!(
+            ctx.accounts.buyer_usdc.owner,
+            signer.key(),
+            ErrorCode::InvalidBuyerTokenOwner
+        );
+
+        require_keys_eq!(
+            ctx.accounts.seller_usdc.owner,
+            pixel.owner,
+            ErrorCode::InvalidSellerTokenOwner
+        );
+
+        require_keys_eq!(
+            ctx.accounts.protocol_usdc.owner,
+            billboard.wallet_rebuy_fees,
+            ErrorCode::InvalidProtocolDestination
+        );
+
+        require_keys_eq!(
+            ctx.accounts.buyer_usdc.mint,
+            ctx.accounts.usdc_mint.key(),
+            ErrorCode::InvalidUsdcMint
+        );
+
+        require_keys_eq!(
+            ctx.accounts.seller_usdc.mint,
+            ctx.accounts.usdc_mint.key(),
+            ErrorCode::InvalidUsdcMint
+        );
+
+        require_keys_eq!(
+            ctx.accounts.protocol_usdc.mint,
+            ctx.accounts.usdc_mint.key(),
+            ErrorCode::InvalidUsdcMint
+        );
+
+        let new_price = pixel
+            .current_price
+            .checked_mul(2)
+            .ok_or(ErrorCode::MathOverflow)?;
+
+        let seller_amount = new_price
+            .checked_mul(95)
+            .ok_or(ErrorCode::MathOverflow)?
+            .checked_div(100)
+            .ok_or(ErrorCode::MathOverflow)?;
+
+        let protocol_amount = new_price
+            .checked_sub(seller_amount)
+            .ok_or(ErrorCode::MathOverflow)?;
+
+        let transfer_to_seller_accounts = Transfer {
+            from: ctx.accounts.buyer_usdc.to_account_info(),
+            to: ctx.accounts.seller_usdc.to_account_info(),
+            authority: signer.to_account_info(),
+        };
+
+        let transfer_to_seller_ctx = CpiContext::new(
+            ctx.accounts.token_program.to_account_info(),
+            transfer_to_seller_accounts,
+        );
+
+        token::transfer(transfer_to_seller_ctx, seller_amount)?;
+
+        let transfer_to_protocol_accounts = Transfer {
+            from: ctx.accounts.buyer_usdc.to_account_info(),
+            to: ctx.accounts.protocol_usdc.to_account_info(),
+            authority: signer.to_account_info(),
+        };
+
+        let transfer_to_protocol_ctx = CpiContext::new(
+            ctx.accounts.token_program.to_account_info(),
+            transfer_to_protocol_accounts,
+        );
+
+        token::transfer(transfer_to_protocol_ctx, protocol_amount)?;
+
+        pixel.owner = signer.key();
+        pixel.current_price = new_price;
+        pixel.rebuy_count = pixel
+            .rebuy_count
+            .checked_add(1)
+            .ok_or(ErrorCode::MathOverflow)?;
+        pixel.name = new_name;
+        pixel.description = new_description;
+        pixel.image_data = new_image_data;
+        pixel.url = new_url;
+
+        billboard.total_usdc_revenue = billboard
+            .total_usdc_revenue
+            .checked_add(protocol_amount)
+            .ok_or(ErrorCode::MathOverflow)?;
+
+        Ok(())
+    }
 }
 
 #[derive(Accounts)]
@@ -177,6 +304,46 @@ pub struct BuyPixel<'info> {
 
     pub token_program: Program<'info, Token>,
     pub system_program: Program<'info, System>,
+}
+
+#[derive(Accounts)]
+pub struct RebuyPixel<'info> {
+    #[account(
+        mut,
+        seeds = [b"billboard"],
+        bump = billboard.bump
+    )]
+    pub billboard: Account<'info, BillboardAccount>,
+
+    #[account(
+        mut,
+        seeds = [
+            b"pixel".as_ref(),
+            pixel.x.to_le_bytes().as_ref(),
+            pixel.y.to_le_bytes().as_ref()
+        ],
+        bump = pixel.bump
+    )]
+    pub pixel: Account<'info, PixelAccount>,
+
+    #[account(mut)]
+    pub signer: Signer<'info>,
+
+    #[account(
+        mut,
+        token::authority = signer
+    )]
+    pub buyer_usdc: Account<'info, TokenAccount>,
+
+    #[account(mut)]
+    pub seller_usdc: Account<'info, TokenAccount>,
+
+    #[account(mut)]
+    pub protocol_usdc: Account<'info, TokenAccount>,
+
+    pub usdc_mint: Account<'info, Mint>,
+
+    pub token_program: Program<'info, Token>,
 }
 
 #[account]
@@ -245,6 +412,16 @@ pub enum ErrorCode {
     InvalidUsdcMint,
     #[msg("Invalid initial buy destination.")]
     InvalidInitialBuyDestination,
+    #[msg("Invalid seller token owner.")]
+    InvalidSellerTokenOwner,
+    #[msg("Invalid buyer token owner.")]
+    InvalidBuyerTokenOwner,
+    #[msg("Invalid protocol destination.")]
+    InvalidProtocolDestination,
+    #[msg("Pixel is locked.")]
+    PixelLocked,
+    #[msg("You already own this pixel.")]
+    AlreadyOwner,
     #[msg("Math overflow.")]
     MathOverflow,
 }
