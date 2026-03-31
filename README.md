@@ -1,55 +1,41 @@
 # onemillionblock
 
+Programme Anchor + script client de démonstration pour **The 1 Million Block** avec architecture:
+
+- 1 pixel acheté = 1 `PixelAccount` on-chain léger
+- metadata partagées via `ContentAccount`
+- aucune dépendance NFT/Metaplex dans le flow pixel
+
 ## Build / validation
 
-Ce repo contient le programme Anchor (`lib.rs`) et un client script (`client.ts`).
-
-### Prérequis minimaux
-
-- Rust stable
-- Solana CLI
-- Anchor CLI (`anchor`)
-- Node.js + npm
-
-### Commandes
-
 ```bash
-# Depuis /workspace/onemillionblock
 rustfmt --check lib.rs
 anchor build
 npm install
-npx tsc --noEmit client.ts
+npx tsc --noEmit client.ts network-config.ts
 ```
 
-## Configuration réseau
+## Exécution du flow client
 
-La config est centralisée dans `network-config.ts`:
+Le script `client.ts` démontre ce scénario:
 
-- `MAINNET_CONFIG`
-- `DEVNET_CONFIG`
-
-### Mainnet (déjà fixé)
-
-- `walletInitialBuys`: `4S54Q3VJAhquMTyBkoGnyCVCawttDTspuWhhhvGT9tGi`
-- `walletRebuyFees`: `2EjN1mGFepKG3sdgCgCzGc676L683DfVXC514doYACpu`
-- `bagsProjectWallet`: `9JuFeQmH8Avbr9cgnquVh2tRXyzWqLj8kcszNykVxovq` *(hors contrat)*
-- `deployAuthority`: `4zGjAP347PS2hBapuMCWWwQDhavFspx9MygBpACcDj8A` *(hors contrat)*
-- `blockTokenMint`: `TODO` (à définir avant `initialize_billboard` mainnet)
-
-### Variables d'environnement
-
-- `ONE_MB_NETWORK=devnet` (par défaut)
-- `ONE_MB_NETWORK=mainnet` pour le mode mainnet
-
-## Exécution client
+1. initialize billboard
+2. create content A
+3. buy plusieurs pixels avec `color + content_ref`
+4. create content B
+5. buy d'autres pixels avec `content_ref` différent
+6. rebuy un pixel (95/5 + prix x2)
+7. lock un pixel (burn 1000 $BLOCK)
+8. update pixel même après lock
+9. update content
 
 ```bash
-# Devnet / flow E2E complet
 ONE_MB_NETWORK=devnet node client.ts
-
-# Mainnet / initialize seulement
-# (échoue explicitement tant que blockTokenMint est TODO)
-ONE_MB_NETWORK=mainnet node client.ts
 ```
 
-Le mode `mainnet` n'exécute pas le flow E2E (mints fake, rebuy/lock), il ne fait que la phase d'initialisation du billboard.
+## Déploiement devnet
+
+```bash
+anchor build
+anchor deploy --provider.cluster devnet
+```
