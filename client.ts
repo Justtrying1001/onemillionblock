@@ -16,6 +16,7 @@ import {
   getMinimumBalanceForRentExemptAccount,
   ASSOCIATED_TOKEN_PROGRAM_ID,
 } from "@solana/spl-token";
+import { resolveNetworkConfig } from "./network-config";
 
 const MPL_TOKEN_METADATA_PROGRAM_ID = new anchor.web3.PublicKey(
   "metaqbxxUerdq28cj1RbAWkYQm3ybzjb6a8bt518x1s"
@@ -25,6 +26,7 @@ const provider = anchor.AnchorProvider.env();
 anchor.setProvider(provider);
 
 const program = anchor.workspace.OneMillionBlock as Program;
+const runtimeConfig = resolveNetworkConfig(process.env.ONE_MB_NETWORK);
 
 const MICRO_USDC = 1_000_000;
 const MICRO_BLOCK = 1_000_000;
@@ -217,19 +219,26 @@ const getOrCreateAta = async (
 
 const run = async () => {
   const buyerWallet = provider.wallet.publicKey;
+  console.log("Runtime network:", runtimeConfig.network);
+  console.log("Main wallets config:");
+  console.log("  wallet_initial_buys:", runtimeConfig.walletInitialBuys.toBase58());
+  console.log("  wallet_rebuy_fees  :", runtimeConfig.walletRebuyFees.toBase58());
+  console.log("  bags project wallet:", runtimeConfig.bagsProjectWallet.toBase58(), "(hors contrat)");
+  console.log("  deploy authority   :", runtimeConfig.deployAuthority.toBase58(), "(hors contrat)");
 
-  // 1) Mint fake USDC
-  const usdcMintKp = await createMintManual(buyerWallet);
-  const usdcMint = usdcMintKp.publicKey;
-  console.log("USDC mint:", usdcMint.toBase58());
+  if (runtimeConfig.network === "mainnet") {
+    console.log(
+      "Mode mainnet: ce script E2E (mints fake + rebuy + lock) est désactivé. Utiliser uniquement initialize_billboard avec la config mainnet."
+    );
+  }
 
-  // 2) Billboard PDA
+  // 1) Billboard PDA
   const [billboardPda] = anchor.web3.PublicKey.findProgramAddressSync(
     [Buffer.from("billboard")],
     program.programId
   );
 
-  // 3) Récupération / init billboard
+  // 2) Récupération / init billboard
   let blockMint: anchor.web3.PublicKey;
   let billboardState: any;
   try {
@@ -237,13 +246,49 @@ const run = async () => {
     blockMint = billboardState.blockTokenMint;
     console.log("Billboard déjà initialisé, réutilisation du block_token_mint existant");
     console.log("BLOCK mint reused from billboard:", blockMint.toBase58());
-  } catch (e) {
-    const blockMintKp = await createMintManual(buyerWallet);
-    blockMint = blockMintKp.publicKey;
-    console.log("New BLOCK mint created:", blockMint.toBase58());
+    if (
+      billboardState.walletInitialBuys.toBase58() !==
+      runtimeConfig.walletInitialBuys.toBase58()
+    ) {
+      throw new Error(
+        `Billboard wallet_initial_buys mismatch. on-chain=${billboardState.walletInitialBuys.toBase58()} config=${runtimeConfig.walletInitialBuys.toBase58()}`
+      );
+    }
+    if (
+      billboardState.walletRebuyFees.toBase58() !==
+      runtimeConfig.walletRebuyFees.toBase58()
+    ) {
+      throw new Error(
+        `Billboard wallet_rebuy_fees mismatch. on-chain=${billboardState.walletRebuyFees.toBase58()} config=${runtimeConfig.walletRebuyFees.toBase58()}`
+      );
+    }
+  } catch (e: any) {
+    if (
+      typeof e?.message === "string" &&
+      e.message.includes("Billboard wallet_")
+    ) {
+      throw e;
+    }
+    if (runtimeConfig.network === "mainnet") {
+      if (!runtimeConfig.blockTokenMint) {
+        throw new Error(
+          "Mainnet config error: block_token_mint is TODO. Set it in network-config.ts before initialize_billboard."
+        );
+      }
+      blockMint = runtimeConfig.blockTokenMint;
+      console.log("Mainnet BLOCK mint from config:", blockMint.toBase58());
+    } else {
+      const blockMintKp = await createMintManual(buyerWallet);
+      blockMint = blockMintKp.publicKey;
+      console.log("Devnet BLOCK mint created:", blockMint.toBase58());
+    }
 
     const initTx = await program.methods
-      .initializeBillboard(buyerWallet, buyerWallet, blockMint)
+      .initializeBillboard(
+        runtimeConfig.walletInitialBuys,
+        runtimeConfig.walletRebuyFees,
+        blockMint
+      )
       .accountsStrict({
         billboard: billboardPda,
         signer: buyerWallet,
@@ -257,6 +302,16 @@ const run = async () => {
   }
   console.log("Final BLOCK mint for this run:", blockMint.toBase58());
 
+  if (runtimeConfig.network === "mainnet") {
+    console.log("Mainnet initialize flow terminé.");
+    return;
+  }
+
+  // 3) Mint fake USDC (devnet/local flow seulement)
+  const usdcMintKp = await createMintManual(buyerWallet);
+  const usdcMint = usdcMintKp.publicKey;
+  console.log("USDC mint:", usdcMint.toBase58());
+
   // 4) Seller wallet
   const seller = anchor.web3.Keypair.generate();
   await sendSolToSeller(seller, 0.3 * anchor.web3.LAMPORTS_PER_SOL);
@@ -265,8 +320,14 @@ const run = async () => {
   // 5) Comptes USDC
   const buyerUsdcKp = await createTokenAccountManual(usdcMint, buyerWallet);
   const sellerUsdcKp = await createTokenAccountManual(usdcMint, seller.publicKey);
-  const initialBuyDestinationKp = await createTokenAccountManual(usdcMint, buyerWallet);
-  const protocolUsdcKp = await createTokenAccountManual(usdcMint, buyerWallet);
+  const initialBuyDestinationKp = await createTokenAccountManual(
+    usdcMint,
+    runtimeConfig.walletInitialBuys
+  );
+  const protocolUsdcKp = await createTokenAccountManual(
+    usdcMint,
+    runtimeConfig.walletRebuyFees
+  );
   const buyerBlockKp = await createTokenAccountManual(blockMint, buyerWallet);
 
   const buyerUsdc = buyerUsdcKp.publicKey;
@@ -392,6 +453,8 @@ const run = async () => {
 
   const rebuyTx = await program.methods
     .rebuyPixel(
+      x,
+      y,
       "Buyer rebuy pixel",
       "Racheté par buyer",
       Buffer.from([9, 9, 9, 9]),
@@ -453,7 +516,7 @@ const run = async () => {
   const buyerBlockBeforeLock = await getTokenBalanceRaw(buyerBlock);
 
   const lockTx = await program.methods
-    .lockPixel()
+    .lockPixel(x, y)
     .accountsStrict({
       owner: buyerWallet,
       billboard: billboardPda,
@@ -488,7 +551,7 @@ const run = async () => {
 
   // Vérification delta (robuste aux runs multiples sur le même billboard)
   const expectedTotalBlockBurned =
-    toNum(billboardAfterRebuy.totalBlockBurned) + 1000;
+    toNum(billboardAfterRebuy.totalBlockBurned) + (1000 * MICRO_BLOCK);
   if (toNum(billboardAfterLock.totalBlockBurned) !== expectedTotalBlockBurned) {
     throw new Error(
       `Lock failed: billboard.totalBlockBurned should be ${expectedTotalBlockBurned}, got ${toNum(billboardAfterLock.totalBlockBurned)}`
@@ -520,7 +583,7 @@ const run = async () => {
   const newUrl = "https://example.com/updated";
 
   const updateMetadataTx = await program.methods
-    .updateMetadata(newName, newDescription, newImageData, newUrl)
+    .updateMetadata(x, y, newName, newDescription, newImageData, newUrl)
     .accountsStrict({
       owner: buyerWallet,
       pixel: pixelPda,
