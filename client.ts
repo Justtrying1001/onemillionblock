@@ -182,6 +182,7 @@ const run = async () => {
         buyerUsdc,
         usdcDestination: initialBuyDestination,
         usdcMint,
+        content: contentA.publicKey,
         tokenProgram: TOKEN_PROGRAM_ID,
         systemProgram: anchor.web3.SystemProgram.programId,
       })
@@ -215,6 +216,7 @@ const run = async () => {
         buyerUsdc,
         usdcDestination: initialBuyDestination,
         usdcMint,
+        content: contentB.publicKey,
         tokenProgram: TOKEN_PROGRAM_ID,
         systemProgram: anchor.web3.SystemProgram.programId,
       })
@@ -225,7 +227,7 @@ const run = async () => {
   const rebuyPda = derivePixelPda(targetRebuy[0], targetRebuy[1]);
   await program.methods
     .rebuyPixel(targetRebuy[0], targetRebuy[1], 0xff0000ff, null)
-    .accountsStrict({
+    .accounts({
       billboard: billboardPda,
       pixel: rebuyPda,
       signer: seller.publicKey,
@@ -259,6 +261,7 @@ const run = async () => {
     .accountsStrict({
       owner: buyerWallet,
       pixel: lockPda,
+      content: contentB.publicKey,
     })
     .rpc();
 

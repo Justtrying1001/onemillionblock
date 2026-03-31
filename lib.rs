@@ -44,7 +44,6 @@ pub mod one_million_block {
         content.name = name;
         content.description = description;
         content.url = url;
-        content.bump = 0;
         Ok(())
     }
 
@@ -93,6 +92,11 @@ pub mod one_million_block {
             ctx.accounts.usdc_mint.key(),
             ErrorCode::InvalidUsdcMint
         );
+        validate_content_ref(
+            content_ref,
+            ctx.accounts.content.as_ref(),
+            ctx.accounts.signer.key(),
+        )?;
 
         token::transfer(
             CpiContext::new(
@@ -175,6 +179,7 @@ pub mod one_million_block {
             ctx.accounts.usdc_mint.key(),
             ErrorCode::InvalidUsdcMint
         );
+        validate_content_ref(new_content_ref, ctx.accounts.content.as_ref(), buyer.key())?;
 
         let new_price = pixel
             .current_price
@@ -317,6 +322,11 @@ pub mod one_million_block {
             ctx.accounts.owner.key(),
             ErrorCode::Unauthorized
         );
+        validate_content_ref(
+            content_ref,
+            ctx.accounts.content.as_ref(),
+            ctx.accounts.owner.key(),
+        )?;
 
         pixel.color = color;
         pixel.content_ref = content_ref;
@@ -332,6 +342,31 @@ fn validate_content_fields(name: &str, description: &str, url: &str) -> Result<(
         ErrorCode::DescriptionTooLong
     );
     require!(url.len() <= MAX_URL_LEN, ErrorCode::UrlTooLong);
+    Ok(())
+}
+
+fn validate_content_ref(
+    content_ref: Option<Pubkey>,
+    content: Option<&Account<ContentAccount>>,
+    signer: Pubkey,
+) -> Result<()> {
+    match (content_ref, content) {
+        (Some(content_ref_key), Some(content_account)) => {
+            require_keys_eq!(
+                content_account.key(),
+                content_ref_key,
+                ErrorCode::ContentRefMismatch
+            );
+            require_keys_eq!(
+                content_account.authority,
+                signer,
+                ErrorCode::UnauthorizedContentAuthority
+            );
+        }
+        (Some(_), None) => return err!(ErrorCode::MissingContentAccount),
+        (None, Some(_)) => return err!(ErrorCode::UnexpectedContentAccount),
+        (None, None) => {}
+    }
     Ok(())
 }
 
@@ -406,6 +441,8 @@ pub struct BuyPixel<'info> {
 
     pub usdc_mint: Account<'info, Mint>,
 
+    pub content: Option<Account<'info, ContentAccount>>,
+
     pub token_program: Program<'info, Token>,
     pub system_program: Program<'info, System>,
 }
@@ -440,6 +477,8 @@ pub struct RebuyPixel<'info> {
     pub protocol_usdc: Account<'info, TokenAccount>,
 
     pub usdc_mint: Account<'info, Mint>,
+
+    pub content: Option<Account<'info, ContentAccount>>,
 
     pub token_program: Program<'info, Token>,
 }
@@ -484,12 +523,16 @@ pub struct UpdatePixel<'info> {
         bump = pixel.bump
     )]
     pub pixel: Account<'info, PixelAccount>,
+
+    pub content: Option<Account<'info, ContentAccount>>,
 }
 
 #[account]
 pub struct BillboardAccount {
     pub total_pixels_sold: u32,
     pub total_pixels_locked: u32,
+    /// Total amount of BLOCK burned in raw mint units (base units),
+    /// not human units. Frontend should divide by 10^decimals.
     pub total_block_burned: u64,
     pub total_usdc_revenue: u64,
     pub wallet_initial_buys: Pubkey,
@@ -526,11 +569,10 @@ pub struct ContentAccount {
     pub name: String,
     pub description: String,
     pub url: String,
-    pub bump: u8,
 }
 
 impl ContentAccount {
-    pub const LEN: usize = 32 + 4 + MAX_NAME_LEN + 4 + MAX_DESCRIPTION_LEN + 4 + MAX_URL_LEN + 1;
+    pub const LEN: usize = 32 + 4 + MAX_NAME_LEN + 4 + MAX_DESCRIPTION_LEN + 4 + MAX_URL_LEN;
 }
 
 #[error_code]
@@ -571,4 +613,12 @@ pub enum ErrorCode {
     InsufficientBlockBalance,
     #[msg("Pixel coordinates do not match the PDA account.")]
     PixelCoordinateMismatch,
+    #[msg("Missing content account for content_ref.")]
+    MissingContentAccount,
+    #[msg("content_ref does not match provided content account.")]
+    ContentRefMismatch,
+    #[msg("Signer is not authorized to use this content.")]
+    UnauthorizedContentAuthority,
+    #[msg("Content account provided while content_ref is None.")]
+    UnexpectedContentAccount,
 }
