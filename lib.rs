@@ -46,16 +46,7 @@ pub mod one_million_block {
         require!(x < 1000, ErrorCode::InvalidCoordinate);
         require!(y < 1000, ErrorCode::InvalidCoordinate);
 
-        require!(name.len() <= MAX_NAME_LEN, ErrorCode::NameTooLong);
-        require!(
-            description.len() <= MAX_DESCRIPTION_LEN,
-            ErrorCode::DescriptionTooLong
-        );
-        require!(url.len() <= MAX_URL_LEN, ErrorCode::UrlTooLong);
-        require!(
-            image_data.len() <= MAX_IMAGE_DATA_LEN,
-            ErrorCode::ImageDataTooLarge
-        );
+        validate_metadata(&name, &description, &image_data, &url)?;
 
         require_keys_eq!(
             ctx.accounts.usdc_destination.owner,
