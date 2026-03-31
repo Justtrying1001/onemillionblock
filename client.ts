@@ -156,12 +156,22 @@ const run = async () => {
     program.programId
   );
 
-  // 3) Init billboard si besoin (blockMint en block token mint)
+  // 3) Récupération / init billboard + block mint conditionnel
+  let blockMint: anchor.web3.PublicKey;
   let billboardState: any;
   try {
     billboardState = await program.account.billboardAccount.fetch(billboardPda);
-    console.log("Billboard déjà initialisé:", billboardPda.toBase58());
+    blockMint = billboardState.blockTokenMint;
+    console.log(
+      "Billboard déjà initialisé, réutilisation du block_token_mint existant"
+    );
+    console.log("Billboard PDA:", billboardPda.toBase58());
+    console.log("BLOCK mint reused from billboard:", blockMint.toBase58());
   } catch (e) {
+    const blockMintKp = await createMintManual(buyerWallet);
+    blockMint = blockMintKp.publicKey;
+    console.log("New BLOCK mint created:", blockMint.toBase58());
+
     const initTx = await program.methods
       .initializeBillboard(buyerWallet, buyerWallet, blockMint)
       .accountsStrict({
@@ -173,13 +183,10 @@ const run = async () => {
 
     console.log("Initialize billboard tx:", initTx);
     billboardState = await program.account.billboardAccount.fetch(billboardPda);
+    console.log("Billboard initialized:", billboardPda.toBase58());
+    console.log("BLOCK mint used for billboard:", blockMint.toBase58());
   }
-
-  if (billboardState.blockTokenMint.toBase58() !== blockMint.toBase58()) {
-    throw new Error(
-      `Billboard block_token_mint incompatible. Expected ${blockMint.toBase58()}, got ${billboardState.blockTokenMint.toBase58()}`
-    );
-  }
+  console.log("Final BLOCK mint for this run:", blockMint.toBase58());
 
   // 4) Seller wallet
   const seller = anchor.web3.Keypair.generate();
