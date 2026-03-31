@@ -1,9 +1,11 @@
 use anchor_lang::prelude::*;
+use anchor_lang::solana_program::program_option::COption;
 use anchor_spl::associated_token::AssociatedToken;
 use anchor_spl::metadata::{
     create_metadata_accounts_v3, mpl_token_metadata::types::DataV2, CreateMetadataAccountsV3,
     Metadata,
 };
+use anchor_spl::token::spl_token::state::AccountState;
 use anchor_spl::token::{
     self, Burn, FreezeAccount, Mint, MintTo, SetAuthority, Token, TokenAccount, Transfer,
 };
@@ -133,9 +135,9 @@ pub mod one_million_block {
                 collection: None,
                 uses: None,
             },
-            true,  // is_mutable : le nom/symbol peuvent être mis à jour plus tard
-            true,  // update_authority_is_signer
-            None,  // collection_details
+            true, // is_mutable : le nom/symbol peuvent être mis à jour plus tard
+            true, // update_authority_is_signer
+            None, // collection_details
         )?;
 
         // 3) Mint 1 token NFT → ATA de l'acheteur
@@ -204,6 +206,8 @@ pub mod one_million_block {
     ///   en désignant le billboard PDA comme delegate, avant d'appeler rebuy_pixel.
     pub fn rebuy_pixel(
         ctx: Context<RebuyPixel>,
+        x: u16,
+        y: u16,
         new_name: String,
         new_description: String,
         new_image_data: Vec<u8>,
@@ -211,10 +215,18 @@ pub mod one_million_block {
     ) -> Result<()> {
         validate_metadata(&new_name, &new_description, &new_image_data, &new_url)?;
 
+        require!(x < 1000, ErrorCode::InvalidCoordinate);
+        require!(y < 1000, ErrorCode::InvalidCoordinate);
+
+        let billboard_bump = ctx.accounts.billboard.bump;
+        let protocol_wallet = ctx.accounts.billboard.wallet_rebuy_fees;
+        let billboard_info = ctx.accounts.billboard.to_account_info();
+
         let pixel = &mut ctx.accounts.pixel;
-        let billboard = &mut ctx.accounts.billboard;
         let signer = &ctx.accounts.signer;
 
+        require!(pixel.x == x, ErrorCode::PixelCoordinateMismatch);
+        require!(pixel.y == y, ErrorCode::PixelCoordinateMismatch);
         require!(!pixel.locked, ErrorCode::PixelLocked);
         require!(pixel.owner != signer.key(), ErrorCode::AlreadyOwner);
 
@@ -230,7 +242,7 @@ pub mod one_million_block {
         );
         require_keys_eq!(
             ctx.accounts.protocol_usdc.owner,
-            billboard.wallet_rebuy_fees,
+            protocol_wallet,
             ErrorCode::InvalidProtocolDestination
         );
         require_keys_eq!(
@@ -259,9 +271,22 @@ pub mod one_million_block {
             ErrorCode::InvalidNftMint
         );
         require_keys_eq!(
+            ctx.accounts.seller_nft_token.owner,
+            pixel.owner,
+            ErrorCode::InvalidNftTokenOwner
+        );
+        require_keys_eq!(
             ctx.accounts.buyer_nft_token.mint,
             pixel.nft_mint,
             ErrorCode::InvalidNftMint
+        );
+        require!(
+            ctx.accounts.seller_nft_token.delegate == COption::Some(ctx.accounts.billboard.key()),
+            ErrorCode::MissingNftDelegateApproval
+        );
+        require!(
+            ctx.accounts.seller_nft_token.delegated_amount >= 1,
+            ErrorCode::MissingNftDelegateApproval
         );
 
         let new_price = pixel
@@ -306,7 +331,6 @@ pub mod one_million_block {
         // 3) Transfer NFT : seller_nft_token → buyer_nft_token
         // Le PDA billboard signe ce transfer car le vendeur lui a délégué via approve().
         // Cela évite que le vendeur doive co-signer la transaction de l'acheteur.
-        let billboard_bump = billboard.bump;
         let billboard_seeds: &[&[u8]] = &[b"billboard", &[billboard_bump]];
         let signer_seeds = &[billboard_seeds];
 
@@ -316,7 +340,7 @@ pub mod one_million_block {
                 Transfer {
                     from: ctx.accounts.seller_nft_token.to_account_info(),
                     to: ctx.accounts.buyer_nft_token.to_account_info(),
-                    authority: ctx.accounts.billboard.to_account_info(),
+                    authority: billboard_info,
                 },
                 signer_seeds,
             ),
@@ -334,10 +358,13 @@ pub mod one_million_block {
         pixel.image_data = new_image_data;
         pixel.url = new_url;
 
-        billboard.total_usdc_revenue = billboard
-            .total_usdc_revenue
-            .checked_add(protocol_amount)
-            .ok_or(ErrorCode::MathOverflow)?;
+        {
+            let billboard = &mut ctx.accounts.billboard;
+            billboard.total_usdc_revenue = billboard
+                .total_usdc_revenue
+                .checked_add(protocol_amount)
+                .ok_or(ErrorCode::MathOverflow)?;
+        }
 
         Ok(())
     }
@@ -350,15 +377,23 @@ pub mod one_million_block {
     ///      Le PDA billboard est la freeze_authority du NFT mint (défini au mint dans buy_pixel).
     ///      Le compte token est gelé → NFT intransférable définitivement.
     ///   3. pixel.locked = true (pas d'instruction unfreeze dans ce programme — jamais)
-    pub fn lock_pixel(ctx: Context<LockPixel>) -> Result<()> {
+    pub fn lock_pixel(ctx: Context<LockPixel>, x: u16, y: u16) -> Result<()> {
+        require!(x < 1000, ErrorCode::InvalidCoordinate);
+        require!(y < 1000, ErrorCode::InvalidCoordinate);
+
+        let billboard_bump = ctx.accounts.billboard.bump;
+        let block_mint = ctx.accounts.billboard.block_token_mint;
+        let billboard_info = ctx.accounts.billboard.to_account_info();
+
         let pixel = &mut ctx.accounts.pixel;
-        let billboard = &mut ctx.accounts.billboard;
         let owner = &ctx.accounts.owner;
 
+        require!(pixel.x == x, ErrorCode::PixelCoordinateMismatch);
+        require!(pixel.y == y, ErrorCode::PixelCoordinateMismatch);
         require!(!pixel.locked, ErrorCode::PixelAlreadyLocked);
         require_keys_eq!(pixel.owner, owner.key(), ErrorCode::Unauthorized);
         require_keys_eq!(
-            billboard.block_token_mint,
+            block_mint,
             ctx.accounts.block_token_mint.key(),
             ErrorCode::InvalidBlockMint
         );
@@ -386,6 +421,14 @@ pub mod one_million_block {
             ctx.accounts.owner_nft_token.owner,
             owner.key(),
             ErrorCode::InvalidNftTokenOwner
+        );
+        require!(
+            ctx.accounts.owner_nft_token.state != AccountState::Frozen,
+            ErrorCode::PixelAlreadyLocked
+        );
+        require!(
+            ctx.accounts.nft_mint.freeze_authority == COption::Some(ctx.accounts.billboard.key()),
+            ErrorCode::InvalidNftFreezeAuthority
         );
 
         // 1) Burn $BLOCK (raw = LOCK_AMOUNT_BLOCK × 10^decimals)
@@ -417,33 +460,33 @@ pub mod one_million_block {
         // 2) Freeze le compte token NFT du propriétaire
         // Le PDA billboard est la freeze_authority (défini lors du createInitializeMintInstruction).
         // Après ce freeze : le NFT ne peut plus être transféré ni brûlé — irréversible.
-        let billboard_bump = billboard.bump;
         let billboard_seeds: &[&[u8]] = &[b"billboard", &[billboard_bump]];
         let signer_seeds = &[billboard_seeds];
 
-        token::freeze_account(
-            CpiContext::new_with_signer(
-                ctx.accounts.token_program.to_account_info(),
-                FreezeAccount {
-                    account: ctx.accounts.owner_nft_token.to_account_info(),
-                    mint: ctx.accounts.nft_mint.to_account_info(),
-                    authority: ctx.accounts.billboard.to_account_info(),
-                },
-                signer_seeds,
-            ),
-        )?;
+        token::freeze_account(CpiContext::new_with_signer(
+            ctx.accounts.token_program.to_account_info(),
+            FreezeAccount {
+                account: ctx.accounts.owner_nft_token.to_account_info(),
+                mint: ctx.accounts.nft_mint.to_account_info(),
+                authority: billboard_info,
+            },
+            signer_seeds,
+        ))?;
 
         pixel.locked = true;
         pixel.locked_at_block = Clock::get()?.slot;
 
-        billboard.total_pixels_locked = billboard
-            .total_pixels_locked
-            .checked_add(1)
-            .ok_or(ErrorCode::MathOverflow)?;
-        billboard.total_block_burned = billboard
-            .total_block_burned
-            .checked_add(LOCK_AMOUNT_BLOCK)
-            .ok_or(ErrorCode::MathOverflow)?;
+        {
+            let billboard = &mut ctx.accounts.billboard;
+            billboard.total_pixels_locked = billboard
+                .total_pixels_locked
+                .checked_add(1)
+                .ok_or(ErrorCode::MathOverflow)?;
+            billboard.total_block_burned = billboard
+                .total_block_burned
+                .checked_add(burn_amount_raw)
+                .ok_or(ErrorCode::MathOverflow)?;
+        }
 
         Ok(())
     }
@@ -451,15 +494,25 @@ pub mod one_million_block {
     /// Mise à jour des métadonnées on-chain (autorisée même après lock).
     pub fn update_metadata(
         ctx: Context<UpdateMetadata>,
+        x: u16,
+        y: u16,
         name: String,
         description: String,
         image_data: Vec<u8>,
         url: String,
     ) -> Result<()> {
         validate_metadata(&name, &description, &image_data, &url)?;
+        require!(x < 1000, ErrorCode::InvalidCoordinate);
+        require!(y < 1000, ErrorCode::InvalidCoordinate);
 
         let pixel = &mut ctx.accounts.pixel;
-        require_keys_eq!(pixel.owner, ctx.accounts.owner.key(), ErrorCode::Unauthorized);
+        require!(pixel.x == x, ErrorCode::PixelCoordinateMismatch);
+        require!(pixel.y == y, ErrorCode::PixelCoordinateMismatch);
+        require_keys_eq!(
+            pixel.owner,
+            ctx.accounts.owner.key(),
+            ErrorCode::Unauthorized
+        );
 
         pixel.name = name;
         pixel.description = description;
@@ -477,9 +530,15 @@ fn validate_metadata(
     url: &String,
 ) -> Result<()> {
     require!(name.len() <= MAX_NAME_LEN, ErrorCode::NameTooLong);
-    require!(description.len() <= MAX_DESCRIPTION_LEN, ErrorCode::DescriptionTooLong);
+    require!(
+        description.len() <= MAX_DESCRIPTION_LEN,
+        ErrorCode::DescriptionTooLong
+    );
     require!(url.len() <= MAX_URL_LEN, ErrorCode::UrlTooLong);
-    require!(image_data.len() <= MAX_IMAGE_DATA_LEN, ErrorCode::ImageDataTooLarge);
+    require!(
+        image_data.len() <= MAX_IMAGE_DATA_LEN,
+        ErrorCode::ImageDataTooLarge
+    );
     Ok(())
 }
 
@@ -566,6 +625,7 @@ pub struct BuyPixel<'info> {
 }
 
 #[derive(Accounts)]
+#[instruction(x: u16, y: u16)]
 pub struct RebuyPixel<'info> {
     #[account(
         mut,
@@ -578,8 +638,8 @@ pub struct RebuyPixel<'info> {
         mut,
         seeds = [
             b"pixel".as_ref(),
-            pixel.x.to_le_bytes().as_ref(),
-            pixel.y.to_le_bytes().as_ref()
+            x.to_le_bytes().as_ref(),
+            y.to_le_bytes().as_ref()
         ],
         bump = pixel.bump
     )]
@@ -622,6 +682,7 @@ pub struct RebuyPixel<'info> {
 }
 
 #[derive(Accounts)]
+#[instruction(x: u16, y: u16)]
 pub struct LockPixel<'info> {
     #[account(mut)]
     pub owner: Signer<'info>,
@@ -637,8 +698,8 @@ pub struct LockPixel<'info> {
         mut,
         seeds = [
             b"pixel".as_ref(),
-            pixel.x.to_le_bytes().as_ref(),
-            pixel.y.to_le_bytes().as_ref()
+            x.to_le_bytes().as_ref(),
+            y.to_le_bytes().as_ref()
         ],
         bump = pixel.bump
     )]
@@ -672,6 +733,7 @@ pub struct LockPixel<'info> {
 }
 
 #[derive(Accounts)]
+#[instruction(x: u16, y: u16)]
 pub struct UpdateMetadata<'info> {
     #[account(mut)]
     pub owner: Signer<'info>,
@@ -680,8 +742,8 @@ pub struct UpdateMetadata<'info> {
         mut,
         seeds = [
             b"pixel".as_ref(),
-            pixel.x.to_le_bytes().as_ref(),
-            pixel.y.to_le_bytes().as_ref()
+            x.to_le_bytes().as_ref(),
+            y.to_le_bytes().as_ref()
         ],
         bump = pixel.bump
     )]
@@ -726,20 +788,23 @@ pub struct PixelAccount {
 }
 
 impl PixelAccount {
-    pub const LEN: usize =
-        2 +
-        2 +
-        32 +
-        8 +
-        1 +
-        1 +
-        8 +
-        32 +
-        4 + MAX_NAME_LEN +
-        4 + MAX_DESCRIPTION_LEN +
-        4 + MAX_IMAGE_DATA_LEN +
-        4 + MAX_URL_LEN +
-        1;
+    pub const LEN: usize = 2
+        + 2
+        + 32
+        + 8
+        + 1
+        + 1
+        + 8
+        + 32
+        + 4
+        + MAX_NAME_LEN
+        + 4
+        + MAX_DESCRIPTION_LEN
+        + 4
+        + MAX_IMAGE_DATA_LEN
+        + 4
+        + MAX_URL_LEN
+        + 1;
 }
 
 // ─────────────────────────────────────────────
@@ -788,4 +853,10 @@ pub enum ErrorCode {
     InvalidNftMint,
     #[msg("Invalid NFT token account owner.")]
     InvalidNftTokenOwner,
+    #[msg("Pixel coordinates do not match the PDA account.")]
+    PixelCoordinateMismatch,
+    #[msg("Missing seller NFT delegate approval for billboard PDA.")]
+    MissingNftDelegateApproval,
+    #[msg("Invalid NFT freeze authority.")]
+    InvalidNftFreezeAuthority,
 }

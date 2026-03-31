@@ -392,6 +392,8 @@ const run = async () => {
 
   const rebuyTx = await program.methods
     .rebuyPixel(
+      x,
+      y,
       "Buyer rebuy pixel",
       "Racheté par buyer",
       Buffer.from([9, 9, 9, 9]),
@@ -453,7 +455,7 @@ const run = async () => {
   const buyerBlockBeforeLock = await getTokenBalanceRaw(buyerBlock);
 
   const lockTx = await program.methods
-    .lockPixel()
+    .lockPixel(x, y)
     .accountsStrict({
       owner: buyerWallet,
       billboard: billboardPda,
@@ -488,7 +490,7 @@ const run = async () => {
 
   // Vérification delta (robuste aux runs multiples sur le même billboard)
   const expectedTotalBlockBurned =
-    toNum(billboardAfterRebuy.totalBlockBurned) + 1000;
+    toNum(billboardAfterRebuy.totalBlockBurned) + (1000 * MICRO_BLOCK);
   if (toNum(billboardAfterLock.totalBlockBurned) !== expectedTotalBlockBurned) {
     throw new Error(
       `Lock failed: billboard.totalBlockBurned should be ${expectedTotalBlockBurned}, got ${toNum(billboardAfterLock.totalBlockBurned)}`
@@ -520,7 +522,7 @@ const run = async () => {
   const newUrl = "https://example.com/updated";
 
   const updateMetadataTx = await program.methods
-    .updateMetadata(newName, newDescription, newImageData, newUrl)
+    .updateMetadata(x, y, newName, newDescription, newImageData, newUrl)
     .accountsStrict({
       owner: buyerWallet,
       pixel: pixelPda,
