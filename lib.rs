@@ -104,11 +104,6 @@ pub mod one_million_block {
             .checked_add(1)
             .ok_or(ErrorCode::MathOverflow)?;
 
-        billboard.total_usdc_revenue = billboard
-            .total_usdc_revenue
-            .checked_add(INITIAL_PRICE_MICRO_USDC)
-            .ok_or(ErrorCode::MathOverflow)?;
-
         Ok(())
     }
 
