@@ -141,10 +141,14 @@ const mintToManual = async (
 const run = async () => {
   const buyerWallet = provider.wallet.publicKey;
 
-  // 1) Mint fake USDC
+  // 1) Mints fake USDC + BLOCK
   const usdcMintKp = await createMintManual(buyerWallet);
   const usdcMint = usdcMintKp.publicKey;
   console.log("USDC mint:", usdcMint.toBase58());
+
+  const blockMintKp = await createMintManual(buyerWallet);
+  const blockMint = blockMintKp.publicKey;
+  console.log("BLOCK mint:", blockMint.toBase58());
 
   // 2) Billboard PDA
   const [billboardPda] = anchor.web3.PublicKey.findProgramAddressSync(
