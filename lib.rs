@@ -1,5 +1,5 @@
 use anchor_lang::prelude::*;
-use anchor_spl::token::{self, Mint, Token, TokenAccount, Transfer};
+use anchor_spl::token::{self, Burn, Mint, Token, TokenAccount, Transfer};
 
 declare_id!("2bizvF84cNRhEQdZPH7nBHCyA712uArhNe11CTg43Cm1");
 
@@ -8,6 +8,7 @@ const MAX_NAME_LEN: usize = 32;
 const MAX_DESCRIPTION_LEN: usize = 200;
 const MAX_URL_LEN: usize = 200;
 const MAX_IMAGE_DATA_LEN: usize = 1024; // temporaire pour Playground/dev
+const LOCK_AMOUNT_BLOCK: u64 = 1_000;
 
 #[program]
 pub mod one_million_block {
@@ -127,22 +128,7 @@ pub mod one_million_block {
         new_image_data: Vec<u8>,
         new_url: String,
     ) -> Result<()> {
-        require!(
-            new_name.len() <= MAX_NAME_LEN,
-            ErrorCode::NameTooLong
-        );
-        require!(
-            new_description.len() <= MAX_DESCRIPTION_LEN,
-            ErrorCode::DescriptionTooLong
-        );
-        require!(
-            new_url.len() <= MAX_URL_LEN,
-            ErrorCode::UrlTooLong
-        );
-        require!(
-            new_image_data.len() <= MAX_IMAGE_DATA_LEN,
-            ErrorCode::ImageDataTooLarge
-        );
+        validate_metadata(&new_name, &new_description, &new_image_data, &new_url)?;
 
         let pixel = &mut ctx.accounts.pixel;
         let billboard = &mut ctx.accounts.billboard;
@@ -246,6 +232,107 @@ pub mod one_million_block {
 
         Ok(())
     }
+
+    pub fn lock_pixel(ctx: Context<LockPixel>) -> Result<()> {
+        let pixel = &mut ctx.accounts.pixel;
+        let billboard = &mut ctx.accounts.billboard;
+        let owner = &ctx.accounts.owner;
+
+        require!(!pixel.locked, ErrorCode::PixelAlreadyLocked);
+        require_keys_eq!(pixel.owner, owner.key(), ErrorCode::Unauthorized);
+        require_keys_eq!(
+            billboard.block_token_mint,
+            ctx.accounts.block_token_mint.key(),
+            ErrorCode::InvalidBlockMint
+        );
+        require_keys_eq!(
+            ctx.accounts.owner_block_token.owner,
+            owner.key(),
+            ErrorCode::InvalidBlockTokenOwner
+        );
+        require_keys_eq!(
+            ctx.accounts.owner_block_token.mint,
+            ctx.accounts.block_token_mint.key(),
+            ErrorCode::InvalidBlockMint
+        );
+
+        let decimals = ctx.accounts.block_token_mint.decimals;
+        let decimals_factor = 10u64
+            .checked_pow(decimals as u32)
+            .ok_or(ErrorCode::MathOverflow)?;
+        let burn_amount_raw = LOCK_AMOUNT_BLOCK
+            .checked_mul(decimals_factor)
+            .ok_or(ErrorCode::MathOverflow)?;
+
+        require!(
+            ctx.accounts.owner_block_token.amount >= burn_amount_raw,
+            ErrorCode::InsufficientBlockBalance
+        );
+
+        let burn_accounts = Burn {
+            mint: ctx.accounts.block_token_mint.to_account_info(),
+            from: ctx.accounts.owner_block_token.to_account_info(),
+            authority: owner.to_account_info(),
+        };
+
+        let burn_ctx = CpiContext::new(ctx.accounts.token_program.to_account_info(), burn_accounts);
+        token::burn(burn_ctx, burn_amount_raw)?;
+
+        pixel.locked = true;
+        pixel.locked_at_block = Clock::get()?.slot;
+
+        billboard.total_pixels_locked = billboard
+            .total_pixels_locked
+            .checked_add(1)
+            .ok_or(ErrorCode::MathOverflow)?;
+        billboard.total_block_burned = billboard
+            .total_block_burned
+            .checked_add(LOCK_AMOUNT_BLOCK)
+            .ok_or(ErrorCode::MathOverflow)?;
+
+        Ok(())
+    }
+
+    pub fn update_metadata(
+        ctx: Context<UpdateMetadata>,
+        name: String,
+        description: String,
+        image_data: Vec<u8>,
+        url: String,
+    ) -> Result<()> {
+        validate_metadata(&name, &description, &image_data, &url)?;
+
+        let pixel = &mut ctx.accounts.pixel;
+        let owner = &ctx.accounts.owner;
+
+        require_keys_eq!(pixel.owner, owner.key(), ErrorCode::Unauthorized);
+
+        pixel.name = name;
+        pixel.description = description;
+        pixel.image_data = image_data;
+        pixel.url = url;
+
+        Ok(())
+    }
+}
+
+fn validate_metadata(
+    name: &String,
+    description: &String,
+    image_data: &Vec<u8>,
+    url: &String,
+) -> Result<()> {
+    require!(name.len() <= MAX_NAME_LEN, ErrorCode::NameTooLong);
+    require!(
+        description.len() <= MAX_DESCRIPTION_LEN,
+        ErrorCode::DescriptionTooLong
+    );
+    require!(url.len() <= MAX_URL_LEN, ErrorCode::UrlTooLong);
+    require!(
+        image_data.len() <= MAX_IMAGE_DATA_LEN,
+        ErrorCode::ImageDataTooLarge
+    );
+    Ok(())
 }
 
 #[derive(Accounts)]
@@ -346,6 +433,61 @@ pub struct RebuyPixel<'info> {
     pub token_program: Program<'info, Token>,
 }
 
+#[derive(Accounts)]
+pub struct LockPixel<'info> {
+    #[account(mut)]
+    pub owner: Signer<'info>,
+
+    #[account(
+        mut,
+        seeds = [b"billboard"],
+        bump = billboard.bump
+    )]
+    pub billboard: Account<'info, BillboardAccount>,
+
+    #[account(
+        mut,
+        seeds = [
+            b"pixel".as_ref(),
+            pixel.x.to_le_bytes().as_ref(),
+            pixel.y.to_le_bytes().as_ref()
+        ],
+        bump = pixel.bump
+    )]
+    pub pixel: Account<'info, PixelAccount>,
+
+    #[account(
+        constraint = block_token_mint.key() == billboard.block_token_mint @ ErrorCode::InvalidBlockMint
+    )]
+    pub block_token_mint: Account<'info, Mint>,
+
+    #[account(
+        mut,
+        constraint = owner_block_token.owner == owner.key() @ ErrorCode::InvalidBlockTokenOwner,
+        constraint = owner_block_token.mint == block_token_mint.key() @ ErrorCode::InvalidBlockMint
+    )]
+    pub owner_block_token: Account<'info, TokenAccount>,
+
+    pub token_program: Program<'info, Token>,
+}
+
+#[derive(Accounts)]
+pub struct UpdateMetadata<'info> {
+    #[account(mut)]
+    pub owner: Signer<'info>,
+
+    #[account(
+        mut,
+        seeds = [
+            b"pixel".as_ref(),
+            pixel.x.to_le_bytes().as_ref(),
+            pixel.y.to_le_bytes().as_ref()
+        ],
+        bump = pixel.bump
+    )]
+    pub pixel: Account<'info, PixelAccount>,
+}
+
 #[account]
 pub struct BillboardAccount {
     pub total_pixels_sold: u32,
@@ -424,4 +566,14 @@ pub enum ErrorCode {
     AlreadyOwner,
     #[msg("Math overflow.")]
     MathOverflow,
+    #[msg("Pixel is already locked.")]
+    PixelAlreadyLocked,
+    #[msg("Unauthorized.")]
+    Unauthorized,
+    #[msg("Invalid BLOCK mint.")]
+    InvalidBlockMint,
+    #[msg("Invalid BLOCK token owner.")]
+    InvalidBlockTokenOwner,
+    #[msg("Insufficient BLOCK balance.")]
+    InsufficientBlockBalance,
 }
