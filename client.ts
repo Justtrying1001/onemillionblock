@@ -18,13 +18,27 @@ anchor.setProvider(provider);
 const program = anchor.workspace.OneMillionBlock as Program;
 
 const MICRO_USDC = 1_000_000;
+const MICRO_BLOCK = 1_000_000;
+
+const toNum = (value: any): number => {
+  if (typeof value === "number") return value;
+  if (typeof value === "bigint") return Number(value);
+  if (value?.toNumber) return value.toNumber();
+  if (value?.toString) return Number(value.toString());
+  return Number(value);
+};
+
+const getTokenBalanceRaw = async (address: anchor.web3.PublicKey): Promise<bigint> => {
+  const account = await getAccount(provider.connection, address);
+  return account.amount;
+};
 
 const logTokenBalance = async (
   label: string,
   address: anchor.web3.PublicKey
 ) => {
-  const account = await getAccount(provider.connection, address);
-  console.log(`${label}:`, Number(account.amount));
+  const amount = await getTokenBalanceRaw(address);
+  console.log(`${label}:`, amount.toString());
 };
 
 const sendSolToSeller = async (
@@ -125,10 +139,14 @@ const mintToManual = async (
 const run = async () => {
   const buyerWallet = provider.wallet.publicKey;
 
-  // 1) Mint fake USDC
+  // 1) Mints fake USDC + BLOCK
   const usdcMintKp = await createMintManual(buyerWallet);
   const usdcMint = usdcMintKp.publicKey;
   console.log("USDC mint:", usdcMint.toBase58());
+
+  const blockMintKp = await createMintManual(buyerWallet);
+  const blockMint = blockMintKp.publicKey;
+  console.log("BLOCK mint:", blockMint.toBase58());
 
   // 2) Billboard PDA
   const [billboardPda] = anchor.web3.PublicKey.findProgramAddressSync(
@@ -136,10 +154,10 @@ const run = async () => {
     program.programId
   );
 
-  // 3) Init billboard si besoin
+  // 3) Init billboard si besoin (blockMint en block token mint)
   try {
     const initTx = await program.methods
-      .initializeBillboard(buyerWallet, buyerWallet, usdcMint)
+      .initializeBillboard(buyerWallet, buyerWallet, blockMint)
       .accountsStrict({
         billboard: billboardPda,
         signer: buyerWallet,
@@ -162,29 +180,34 @@ const run = async () => {
   const sellerUsdcKp = await createTokenAccountManual(usdcMint, seller.publicKey);
   const initialBuyDestinationKp = await createTokenAccountManual(usdcMint, buyerWallet);
   const protocolUsdcKp = await createTokenAccountManual(usdcMint, buyerWallet);
+  const buyerBlockKp = await createTokenAccountManual(blockMint, buyerWallet);
 
   const buyerUsdc = buyerUsdcKp.publicKey;
   const sellerUsdc = sellerUsdcKp.publicKey;
   const initialBuyDestination = initialBuyDestinationKp.publicKey;
   const protocolUsdc = protocolUsdcKp.publicKey;
+  const buyerBlock = buyerBlockKp.publicKey;
 
-  console.log("Buyer token account:", buyerUsdc.toBase58());
-  console.log("Seller token account:", sellerUsdc.toBase58());
+  console.log("Buyer USDC token account:", buyerUsdc.toBase58());
+  console.log("Seller USDC token account:", sellerUsdc.toBase58());
   console.log(
     "Initial buy destination token account:",
     initialBuyDestination.toBase58()
   );
-  console.log("Protocol token account:", protocolUsdc.toBase58());
+  console.log("Protocol USDC token account:", protocolUsdc.toBase58());
+  console.log("Buyer BLOCK token account:", buyerBlock.toBase58());
 
-  // 6) Mint fake USDC
+  // 6) Mint fake USDC + BLOCK
   await mintToManual(usdcMint, buyerUsdc, buyerWallet, 10 * MICRO_USDC);
   await mintToManual(usdcMint, sellerUsdc, buyerWallet, 10 * MICRO_USDC);
+  await mintToManual(blockMint, buyerBlock, buyerWallet, 2000 * MICRO_BLOCK);
 
-  console.log("Minted 10 fake USDC to buyer and seller");
+  console.log("Minted fake tokens");
 
-  await logTokenBalance("Buyer balance before buy", buyerUsdc);
-  await logTokenBalance("Seller balance before buy", sellerUsdc);
-  await logTokenBalance("Protocol balance before rebuy", protocolUsdc);
+  await logTokenBalance("Buyer USDC before buy", buyerUsdc);
+  await logTokenBalance("Seller USDC before buy", sellerUsdc);
+  await logTokenBalance("Protocol USDC before rebuy", protocolUsdc);
+  await logTokenBalance("Buyer BLOCK before lock", buyerBlock);
 
   // 7) Pixel fresh
   const x = 52;
@@ -229,10 +252,10 @@ const run = async () => {
   const pixelAfterBuy = await program.account.pixelAccount.fetch(pixelPda);
   console.log("Pixel after buy:", pixelAfterBuy);
 
-  await logTokenBalance("Buyer balance after initial buy", buyerUsdc);
-  await logTokenBalance("Seller balance after initial buy", sellerUsdc);
+  await logTokenBalance("Buyer USDC after initial buy", buyerUsdc);
+  await logTokenBalance("Seller USDC after initial buy", sellerUsdc);
   await logTokenBalance(
-    "Initial buy destination balance after initial buy",
+    "Initial buy destination after initial buy",
     initialBuyDestination
   );
 
@@ -258,7 +281,6 @@ const run = async () => {
 
   console.log("Rebuy tx:", rebuyTx);
 
-  // 10) Etat final
   const pixelAfterRebuy = await program.account.pixelAccount.fetch(pixelPda);
   const billboardAfterRebuy = await program.account.billboardAccount.fetch(
     billboardPda
@@ -267,18 +289,112 @@ const run = async () => {
   console.log("Pixel after rebuy:", pixelAfterRebuy);
   console.log("Billboard after rebuy:", billboardAfterRebuy);
 
-  await logTokenBalance("Buyer balance after rebuy", buyerUsdc);
-  await logTokenBalance("Seller balance after rebuy", sellerUsdc);
-  await logTokenBalance("Protocol balance after rebuy", protocolUsdc);
+  await logTokenBalance("Buyer USDC after rebuy", buyerUsdc);
+  await logTokenBalance("Seller USDC after rebuy", sellerUsdc);
+  await logTokenBalance("Protocol USDC after rebuy", protocolUsdc);
 
-  console.log("Expected after rebuy:");
-  console.log("- pixel.owner = buyer wallet");
-  console.log("- pixel.currentPrice = 2000000");
-  console.log("- pixel.rebuyCount = 1");
-  console.log("- seller received 1900000");
-  console.log("- protocol received 100000");
+  if (pixelAfterRebuy.owner.toBase58() !== buyerWallet.toBase58()) {
+    throw new Error("Rebuy failed: owner is not buyer wallet");
+  }
+
+  if (toNum(pixelAfterRebuy.currentPrice) !== 2 * MICRO_USDC) {
+    throw new Error("Rebuy failed: currentPrice is not 2 USDC");
+  }
+
+  if (toNum(pixelAfterRebuy.rebuyCount) !== 1) {
+    throw new Error("Rebuy failed: rebuyCount is not 1");
+  }
+
+  // 10) Lock pixel par owner final (buyer)
+  const buyerBlockBeforeLock = await getTokenBalanceRaw(buyerBlock);
+
+  const lockTx = await program.methods
+    .lockPixel()
+    .accountsStrict({
+      owner: buyerWallet,
+      billboard: billboardPda,
+      pixel: pixelPda,
+      blockTokenMint: blockMint,
+      ownerBlockToken: buyerBlock,
+      tokenProgram: TOKEN_PROGRAM_ID,
+    })
+    .rpc();
+
+  console.log("Lock tx:", lockTx);
+
+  const pixelAfterLock = await program.account.pixelAccount.fetch(pixelPda);
+  const billboardAfterLock = await program.account.billboardAccount.fetch(
+    billboardPda
+  );
+  const buyerBlockAfterLock = await getTokenBalanceRaw(buyerBlock);
+
+  console.log("Pixel after lock:", pixelAfterLock);
+  console.log("Billboard after lock:", billboardAfterLock);
+  await logTokenBalance("Buyer BLOCK after lock", buyerBlock);
+
+  if (pixelAfterLock.locked !== true) {
+    throw new Error("Lock failed: pixel.locked should be true");
+  }
+
+  if (toNum(pixelAfterLock.lockedAtBlock) <= 0) {
+    throw new Error("Lock failed: pixel.lockedAtBlock should be > 0");
+  }
+
+  if (toNum(billboardAfterLock.totalPixelsLocked) < 1) {
+    throw new Error("Lock failed: billboard.totalPixelsLocked should be >= 1");
+  }
+
+  if (toNum(billboardAfterLock.totalBlockBurned) !== 1000) {
+    throw new Error("Lock failed: billboard.totalBlockBurned should be 1000");
+  }
+
+  const expectedBurnRaw = BigInt(1000 * MICRO_BLOCK);
+  const actualBurnRaw = buyerBlockBeforeLock - buyerBlockAfterLock;
+  if (actualBurnRaw !== expectedBurnRaw) {
+    throw new Error(
+      `Lock failed: expected BLOCK burn ${expectedBurnRaw.toString()}, got ${actualBurnRaw.toString()}`
+    );
+  }
+
+  // 11) Update metadata après lock
+  const newName = "Locked buyer pixel";
+  const newDescription = "Metadata update after lock";
+  const newImageData = Buffer.from([7, 7, 7, 7, 7]);
+  const newUrl = "https://example.com/updated";
+
+  const updateMetadataTx = await program.methods
+    .updateMetadata(newName, newDescription, newImageData, newUrl)
+    .accountsStrict({
+      owner: buyerWallet,
+      pixel: pixelPda,
+    })
+    .rpc();
+
+  console.log("Update metadata tx:", updateMetadataTx);
+
+  const pixelAfterUpdate = await program.account.pixelAccount.fetch(pixelPda);
+  console.log("Pixel after update metadata:", pixelAfterUpdate);
+
+  if (pixelAfterUpdate.name !== newName) {
+    throw new Error("Update metadata failed: name mismatch");
+  }
+
+  if (pixelAfterUpdate.description !== newDescription) {
+    throw new Error("Update metadata failed: description mismatch");
+  }
+
+  if (pixelAfterUpdate.url !== newUrl) {
+    throw new Error("Update metadata failed: url mismatch");
+  }
+
+  if (Buffer.from(pixelAfterUpdate.imageData).toString("hex") !== newImageData.toString("hex")) {
+    throw new Error("Update metadata failed: imageData mismatch");
+  }
+
+  console.log("E2E script completed successfully ✅");
 };
 
 run().catch((err) => {
   console.error(err);
+  process.exit(1);
 });
