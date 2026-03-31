@@ -29,6 +29,14 @@ Le script `client.ts` démontre ce scénario:
 8. update pixel même après lock
 9. update content
 
+## Convention sur `total_block_burned`
+
+`BillboardAccount.total_block_burned` est stocké **en raw mint units on-chain**
+(base units SPL token).  
+Exemple: pour un mint à 6 décimales, burn de 1000 BLOCK = `1_000_000_000` unités raw.
+
+Les clients/frontends doivent normaliser avec `10^decimals` pour afficher une valeur humaine.
+
 ```bash
 ONE_MB_NETWORK=devnet node client.ts
 ```
