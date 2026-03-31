@@ -146,10 +146,6 @@ const run = async () => {
   const usdcMint = usdcMintKp.publicKey;
   console.log("USDC mint:", usdcMint.toBase58());
 
-  const blockMintKp = await createMintManual(buyerWallet);
-  const blockMint = blockMintKp.publicKey;
-  console.log("BLOCK mint:", blockMint.toBase58());
-
   // 2) Billboard PDA
   const [billboardPda] = anchor.web3.PublicKey.findProgramAddressSync(
     [Buffer.from("billboard")],
@@ -364,8 +360,12 @@ const run = async () => {
     throw new Error("Lock failed: billboard.totalPixelsLocked should be >= 1");
   }
 
-  if (toNum(billboardAfterLock.totalBlockBurned) !== 1000) {
-    throw new Error("Lock failed: billboard.totalBlockBurned should be 1000");
+  const expectedTotalBlockBurned =
+    toNum(billboardAfterRebuy.totalBlockBurned) + 1000;
+  if (toNum(billboardAfterLock.totalBlockBurned) !== expectedTotalBlockBurned) {
+    throw new Error(
+      `Lock failed: billboard.totalBlockBurned should be ${expectedTotalBlockBurned}, got ${toNum(billboardAfterLock.totalBlockBurned)}`
+    );
   }
 
   const expectedBurnRaw = BigInt(1000 * MICRO_BLOCK);
