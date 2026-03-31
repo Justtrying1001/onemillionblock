@@ -1,5 +1,12 @@
 use anchor_lang::prelude::*;
-use anchor_spl::token::{self, Burn, Mint, Token, TokenAccount, Transfer};
+use anchor_spl::associated_token::AssociatedToken;
+use anchor_spl::metadata::{
+    create_metadata_accounts_v3, mpl_token_metadata::types::DataV2, CreateMetadataAccountsV3,
+    Metadata,
+};
+use anchor_spl::token::{
+    self, Burn, FreezeAccount, Mint, MintTo, SetAuthority, Token, TokenAccount, Transfer,
+};
 
 declare_id!("2bizvF84cNRhEQdZPH7nBHCyA712uArhNe11CTg43Cm1");
 
@@ -9,6 +16,14 @@ const MAX_DESCRIPTION_LEN: usize = 200;
 const MAX_URL_LEN: usize = 200;
 const MAX_IMAGE_DATA_LEN: usize = 1024; // temporaire pour Playground/dev
 const LOCK_AMOUNT_BLOCK: u64 = 1_000;
+const NFT_SYMBOL: &str = "1MB";
+
+// TODO Phase 2D — Metaplex Inscription :
+// Actuellement name, description, image_data, url sont stockés dans PixelAccount.
+// Migrer vers Metaplex Inscription Program (mpl-inscription) pour un stockage
+// 100% on-chain indépendant du programme.
+// Instruction future : initialize_inscription + write_data vers InscriptionAccount,
+// référencé depuis PixelAccount via un champ inscription_account: Pubkey.
 
 #[program]
 pub mod one_million_block {
@@ -21,7 +36,6 @@ pub mod one_million_block {
         block_token_mint: Pubkey,
     ) -> Result<()> {
         let billboard = &mut ctx.accounts.billboard;
-
         billboard.total_pixels_sold = 0;
         billboard.total_pixels_locked = 0;
         billboard.total_block_burned = 0;
@@ -30,10 +44,22 @@ pub mod one_million_block {
         billboard.wallet_rebuy_fees = wallet_rebuy_fees;
         billboard.block_token_mint = block_token_mint;
         billboard.bump = ctx.bumps.billboard;
-
         Ok(())
     }
 
+    /// Phase 2A — Crée un vrai NFT Metaplex pour le pixel acheté.
+    ///
+    /// Flux :
+    ///   1. Transfer 1 USDC → wallet_initial_buys
+    ///   2. CPI → Metaplex Token Metadata : CreateMetadataAccountsV3
+    ///      - name = nom du pixel, symbol = "1MB", uri = "" (données on-chain dans PixelAccount)
+    ///      - update_authority = PDA billboard (le programme contrôle les métadonnées)
+    ///   3. Mint 1 token NFT → ATA de l'acheteur
+    ///   4. Révoquer la mint_authority (supply fixée à 1 définitivement)
+    ///   5. Stocker pixel.nft_mint
+    ///
+    /// Prérequis client : le nft_mint doit être créé en amont avec
+    ///   mint_authority = signer, freeze_authority = billboard PDA.
     pub fn buy_pixel(
         ctx: Context<BuyPixel>,
         x: u16,
@@ -45,7 +71,6 @@ pub mod one_million_block {
     ) -> Result<()> {
         require!(x < 1000, ErrorCode::InvalidCoordinate);
         require!(y < 1000, ErrorCode::InvalidCoordinate);
-
         validate_metadata(&name, &description, &image_data, &url)?;
 
         require_keys_eq!(
@@ -53,50 +78,109 @@ pub mod one_million_block {
             ctx.accounts.billboard.wallet_initial_buys,
             ErrorCode::InvalidInitialBuyDestination
         );
-
         require_keys_eq!(
             ctx.accounts.buyer_usdc.mint,
             ctx.accounts.usdc_mint.key(),
             ErrorCode::InvalidUsdcMint
         );
-
         require_keys_eq!(
             ctx.accounts.usdc_destination.mint,
             ctx.accounts.usdc_mint.key(),
             ErrorCode::InvalidUsdcMint
         );
 
-        let transfer_accounts = Transfer {
-            from: ctx.accounts.buyer_usdc.to_account_info(),
-            to: ctx.accounts.usdc_destination.to_account_info(),
-            authority: ctx.accounts.signer.to_account_info(),
-        };
+        // 1) Transfer 1 USDC → wallet_initial_buys (100% au trésor initial)
+        token::transfer(
+            CpiContext::new(
+                ctx.accounts.token_program.to_account_info(),
+                Transfer {
+                    from: ctx.accounts.buyer_usdc.to_account_info(),
+                    to: ctx.accounts.usdc_destination.to_account_info(),
+                    authority: ctx.accounts.signer.to_account_info(),
+                },
+            ),
+            INITIAL_PRICE_MICRO_USDC,
+        )?;
 
-        let transfer_ctx = CpiContext::new(
-            ctx.accounts.token_program.to_account_info(),
-            transfer_accounts,
-        );
+        // Seeds du PDA billboard pour signer les CPIs en son nom
+        let billboard_bump = ctx.accounts.billboard.bump;
+        let billboard_seeds: &[&[u8]] = &[b"billboard", &[billboard_bump]];
+        let signer_seeds = &[billboard_seeds];
 
-        token::transfer(transfer_ctx, INITIAL_PRICE_MICRO_USDC)?;
+        // 2) CPI → Metaplex Token Metadata : CreateMetadataAccountsV3
+        // L'update_authority du NFT est le PDA billboard (permet update_metadata_v2 futur).
+        // uri = "" car les données réelles sont dans PixelAccount (futur : Inscription).
+        create_metadata_accounts_v3(
+            CpiContext::new_with_signer(
+                ctx.accounts.metadata_program.to_account_info(),
+                CreateMetadataAccountsV3 {
+                    metadata: ctx.accounts.nft_metadata.to_account_info(),
+                    mint: ctx.accounts.nft_mint.to_account_info(),
+                    mint_authority: ctx.accounts.signer.to_account_info(),
+                    payer: ctx.accounts.signer.to_account_info(),
+                    update_authority: ctx.accounts.billboard.to_account_info(),
+                    system_program: ctx.accounts.system_program.to_account_info(),
+                    rent: ctx.accounts.rent.to_account_info(),
+                },
+                signer_seeds,
+            ),
+            DataV2 {
+                name: name.clone(),
+                symbol: NFT_SYMBOL.to_string(),
+                uri: String::new(),
+                seller_fee_basis_points: 0,
+                creators: None,
+                collection: None,
+                uses: None,
+            },
+            true,  // is_mutable : le nom/symbol peuvent être mis à jour plus tard
+            true,  // update_authority_is_signer
+            None,  // collection_details
+        )?;
 
+        // 3) Mint 1 token NFT → ATA de l'acheteur
+        // Le signer est la mint_authority (défini lors de la création du mint côté client).
+        token::mint_to(
+            CpiContext::new(
+                ctx.accounts.token_program.to_account_info(),
+                MintTo {
+                    mint: ctx.accounts.nft_mint.to_account_info(),
+                    to: ctx.accounts.buyer_nft_token.to_account_info(),
+                    authority: ctx.accounts.signer.to_account_info(),
+                },
+            ),
+            1,
+        )?;
+
+        // 4) Révoquer la mint_authority → supply max = 1 (vrai NFT non-fongible)
+        token::set_authority(
+            CpiContext::new(
+                ctx.accounts.token_program.to_account_info(),
+                SetAuthority {
+                    current_authority: ctx.accounts.signer.to_account_info(),
+                    account_or_mint: ctx.accounts.nft_mint.to_account_info(),
+                },
+            ),
+            token::spl_token::instruction::AuthorityType::MintTokens,
+            None,
+        )?;
+
+        // 5) Init PixelAccount
         let pixel = &mut ctx.accounts.pixel;
         let billboard = &mut ctx.accounts.billboard;
-        let signer = &ctx.accounts.signer;
 
         pixel.x = x;
         pixel.y = y;
-        pixel.owner = signer.key();
+        pixel.owner = ctx.accounts.signer.key();
         pixel.current_price = INITIAL_PRICE_MICRO_USDC;
         pixel.rebuy_count = 0;
         pixel.locked = false;
         pixel.locked_at_block = 0;
-        pixel.nft_mint = Pubkey::default();
-
+        pixel.nft_mint = ctx.accounts.nft_mint.key();
         pixel.name = name;
         pixel.description = description;
         pixel.image_data = image_data;
         pixel.url = url;
-
         pixel.bump = ctx.bumps.pixel;
 
         billboard.total_pixels_sold = billboard
@@ -107,6 +191,17 @@ pub mod one_million_block {
         Ok(())
     }
 
+    /// Phase 2B — Rachète un pixel : transfère USDC + transfère le NFT SPL.
+    ///
+    /// Flux :
+    ///   1. Calcul nouveau prix (×2), split 95% vendeur / 5% protocole
+    ///   2. Transfer USDC : buyer → seller (95%) + buyer → protocol (5%)
+    ///   3. CPI Token Transfer NFT : seller_nft_token → buyer_nft_token
+    ///      Le PDA billboard est le delegate du seller_nft_token (approve côté client).
+    ///   4. Mise à jour pixel.owner + métadonnées
+    ///
+    /// Prérequis client : le vendeur doit appeler approve() sur son ATA NFT
+    ///   en désignant le billboard PDA comme delegate, avant d'appeler rebuy_pixel.
     pub fn rebuy_pixel(
         ctx: Context<RebuyPixel>,
         new_name: String,
@@ -128,77 +223,105 @@ pub mod one_million_block {
             signer.key(),
             ErrorCode::InvalidBuyerTokenOwner
         );
-
         require_keys_eq!(
             ctx.accounts.seller_usdc.owner,
             pixel.owner,
             ErrorCode::InvalidSellerTokenOwner
         );
-
         require_keys_eq!(
             ctx.accounts.protocol_usdc.owner,
             billboard.wallet_rebuy_fees,
             ErrorCode::InvalidProtocolDestination
         );
-
         require_keys_eq!(
             ctx.accounts.buyer_usdc.mint,
             ctx.accounts.usdc_mint.key(),
             ErrorCode::InvalidUsdcMint
         );
-
         require_keys_eq!(
             ctx.accounts.seller_usdc.mint,
             ctx.accounts.usdc_mint.key(),
             ErrorCode::InvalidUsdcMint
         );
-
         require_keys_eq!(
             ctx.accounts.protocol_usdc.mint,
             ctx.accounts.usdc_mint.key(),
             ErrorCode::InvalidUsdcMint
+        );
+        require_keys_eq!(
+            ctx.accounts.nft_mint.key(),
+            pixel.nft_mint,
+            ErrorCode::InvalidNftMint
+        );
+        require_keys_eq!(
+            ctx.accounts.seller_nft_token.mint,
+            pixel.nft_mint,
+            ErrorCode::InvalidNftMint
+        );
+        require_keys_eq!(
+            ctx.accounts.buyer_nft_token.mint,
+            pixel.nft_mint,
+            ErrorCode::InvalidNftMint
         );
 
         let new_price = pixel
             .current_price
             .checked_mul(2)
             .ok_or(ErrorCode::MathOverflow)?;
-
         let seller_amount = new_price
             .checked_mul(95)
             .ok_or(ErrorCode::MathOverflow)?
             .checked_div(100)
             .ok_or(ErrorCode::MathOverflow)?;
-
         let protocol_amount = new_price
             .checked_sub(seller_amount)
             .ok_or(ErrorCode::MathOverflow)?;
 
-        let transfer_to_seller_accounts = Transfer {
-            from: ctx.accounts.buyer_usdc.to_account_info(),
-            to: ctx.accounts.seller_usdc.to_account_info(),
-            authority: signer.to_account_info(),
-        };
+        // 1) Transfer USDC → vendeur (95%)
+        token::transfer(
+            CpiContext::new(
+                ctx.accounts.token_program.to_account_info(),
+                Transfer {
+                    from: ctx.accounts.buyer_usdc.to_account_info(),
+                    to: ctx.accounts.seller_usdc.to_account_info(),
+                    authority: signer.to_account_info(),
+                },
+            ),
+            seller_amount,
+        )?;
 
-        let transfer_to_seller_ctx = CpiContext::new(
-            ctx.accounts.token_program.to_account_info(),
-            transfer_to_seller_accounts,
-        );
+        // 2) Transfer USDC → protocole (5%)
+        token::transfer(
+            CpiContext::new(
+                ctx.accounts.token_program.to_account_info(),
+                Transfer {
+                    from: ctx.accounts.buyer_usdc.to_account_info(),
+                    to: ctx.accounts.protocol_usdc.to_account_info(),
+                    authority: signer.to_account_info(),
+                },
+            ),
+            protocol_amount,
+        )?;
 
-        token::transfer(transfer_to_seller_ctx, seller_amount)?;
+        // 3) Transfer NFT : seller_nft_token → buyer_nft_token
+        // Le PDA billboard signe ce transfer car le vendeur lui a délégué via approve().
+        // Cela évite que le vendeur doive co-signer la transaction de l'acheteur.
+        let billboard_bump = billboard.bump;
+        let billboard_seeds: &[&[u8]] = &[b"billboard", &[billboard_bump]];
+        let signer_seeds = &[billboard_seeds];
 
-        let transfer_to_protocol_accounts = Transfer {
-            from: ctx.accounts.buyer_usdc.to_account_info(),
-            to: ctx.accounts.protocol_usdc.to_account_info(),
-            authority: signer.to_account_info(),
-        };
-
-        let transfer_to_protocol_ctx = CpiContext::new(
-            ctx.accounts.token_program.to_account_info(),
-            transfer_to_protocol_accounts,
-        );
-
-        token::transfer(transfer_to_protocol_ctx, protocol_amount)?;
+        token::transfer(
+            CpiContext::new_with_signer(
+                ctx.accounts.token_program.to_account_info(),
+                Transfer {
+                    from: ctx.accounts.seller_nft_token.to_account_info(),
+                    to: ctx.accounts.buyer_nft_token.to_account_info(),
+                    authority: ctx.accounts.billboard.to_account_info(),
+                },
+                signer_seeds,
+            ),
+            1,
+        )?;
 
         pixel.owner = signer.key();
         pixel.current_price = new_price;
@@ -219,6 +342,14 @@ pub mod one_million_block {
         Ok(())
     }
 
+    /// Phase 2C — Verrouille le pixel de façon irréversible.
+    ///
+    /// Flux :
+    ///   1. Burn 1 000 $BLOCK (raw = 1 000 × 10^decimals)
+    ///   2. CPI → Token Program : freeze_account sur owner_nft_token
+    ///      Le PDA billboard est la freeze_authority du NFT mint (défini au mint dans buy_pixel).
+    ///      Le compte token est gelé → NFT intransférable définitivement.
+    ///   3. pixel.locked = true (pas d'instruction unfreeze dans ce programme — jamais)
     pub fn lock_pixel(ctx: Context<LockPixel>) -> Result<()> {
         let pixel = &mut ctx.accounts.pixel;
         let billboard = &mut ctx.accounts.billboard;
@@ -241,7 +372,23 @@ pub mod one_million_block {
             ctx.accounts.block_token_mint.key(),
             ErrorCode::InvalidBlockMint
         );
+        require_keys_eq!(
+            ctx.accounts.nft_mint.key(),
+            pixel.nft_mint,
+            ErrorCode::InvalidNftMint
+        );
+        require_keys_eq!(
+            ctx.accounts.owner_nft_token.mint,
+            pixel.nft_mint,
+            ErrorCode::InvalidNftMint
+        );
+        require_keys_eq!(
+            ctx.accounts.owner_nft_token.owner,
+            owner.key(),
+            ErrorCode::InvalidNftTokenOwner
+        );
 
+        // 1) Burn $BLOCK (raw = LOCK_AMOUNT_BLOCK × 10^decimals)
         let decimals = ctx.accounts.block_token_mint.decimals;
         let decimals_factor = 10u64
             .checked_pow(decimals as u32)
@@ -255,14 +402,36 @@ pub mod one_million_block {
             ErrorCode::InsufficientBlockBalance
         );
 
-        let burn_accounts = Burn {
-            mint: ctx.accounts.block_token_mint.to_account_info(),
-            from: ctx.accounts.owner_block_token.to_account_info(),
-            authority: owner.to_account_info(),
-        };
+        token::burn(
+            CpiContext::new(
+                ctx.accounts.token_program.to_account_info(),
+                Burn {
+                    mint: ctx.accounts.block_token_mint.to_account_info(),
+                    from: ctx.accounts.owner_block_token.to_account_info(),
+                    authority: owner.to_account_info(),
+                },
+            ),
+            burn_amount_raw,
+        )?;
 
-        let burn_ctx = CpiContext::new(ctx.accounts.token_program.to_account_info(), burn_accounts);
-        token::burn(burn_ctx, burn_amount_raw)?;
+        // 2) Freeze le compte token NFT du propriétaire
+        // Le PDA billboard est la freeze_authority (défini lors du createInitializeMintInstruction).
+        // Après ce freeze : le NFT ne peut plus être transféré ni brûlé — irréversible.
+        let billboard_bump = billboard.bump;
+        let billboard_seeds: &[&[u8]] = &[b"billboard", &[billboard_bump]];
+        let signer_seeds = &[billboard_seeds];
+
+        token::freeze_account(
+            CpiContext::new_with_signer(
+                ctx.accounts.token_program.to_account_info(),
+                FreezeAccount {
+                    account: ctx.accounts.owner_nft_token.to_account_info(),
+                    mint: ctx.accounts.nft_mint.to_account_info(),
+                    authority: ctx.accounts.billboard.to_account_info(),
+                },
+                signer_seeds,
+            ),
+        )?;
 
         pixel.locked = true;
         pixel.locked_at_block = Clock::get()?.slot;
@@ -279,6 +448,7 @@ pub mod one_million_block {
         Ok(())
     }
 
+    /// Mise à jour des métadonnées on-chain (autorisée même après lock).
     pub fn update_metadata(
         ctx: Context<UpdateMetadata>,
         name: String,
@@ -289,9 +459,7 @@ pub mod one_million_block {
         validate_metadata(&name, &description, &image_data, &url)?;
 
         let pixel = &mut ctx.accounts.pixel;
-        let owner = &ctx.accounts.owner;
-
-        require_keys_eq!(pixel.owner, owner.key(), ErrorCode::Unauthorized);
+        require_keys_eq!(pixel.owner, ctx.accounts.owner.key(), ErrorCode::Unauthorized);
 
         pixel.name = name;
         pixel.description = description;
@@ -309,17 +477,15 @@ fn validate_metadata(
     url: &String,
 ) -> Result<()> {
     require!(name.len() <= MAX_NAME_LEN, ErrorCode::NameTooLong);
-    require!(
-        description.len() <= MAX_DESCRIPTION_LEN,
-        ErrorCode::DescriptionTooLong
-    );
+    require!(description.len() <= MAX_DESCRIPTION_LEN, ErrorCode::DescriptionTooLong);
     require!(url.len() <= MAX_URL_LEN, ErrorCode::UrlTooLong);
-    require!(
-        image_data.len() <= MAX_IMAGE_DATA_LEN,
-        ErrorCode::ImageDataTooLarge
-    );
+    require!(image_data.len() <= MAX_IMAGE_DATA_LEN, ErrorCode::ImageDataTooLarge);
     Ok(())
 }
+
+// ─────────────────────────────────────────────
+// ACCOUNT CONTEXTS
+// ─────────────────────────────────────────────
 
 #[derive(Accounts)]
 pub struct InitializeBillboard<'info> {
@@ -364,19 +530,39 @@ pub struct BuyPixel<'info> {
     #[account(mut)]
     pub signer: Signer<'info>,
 
-    #[account(
-        mut,
-        token::authority = signer
-    )]
+    /// Compte USDC de l'acheteur (source du paiement)
+    #[account(mut, token::authority = signer)]
     pub buyer_usdc: Account<'info, TokenAccount>,
 
+    /// Destination USDC (wallet_initial_buys)
     #[account(mut)]
     pub usdc_destination: Account<'info, TokenAccount>,
 
     pub usdc_mint: Account<'info, Mint>,
 
+    /// Mint NFT de ce pixel (créé en amont avec decimals=0, freeze_authority=billboard PDA)
+    #[account(mut)]
+    pub nft_mint: Account<'info, Mint>,
+
+    /// Metadata account Metaplex (PDA dérivé par Metaplex, adresse calculée côté client)
+    /// CHECK: adresse validée par le CPI Metaplex Token Metadata
+    #[account(mut)]
+    pub nft_metadata: UncheckedAccount<'info>,
+
+    /// ATA de l'acheteur pour le NFT mint (créé si inexistant)
+    #[account(
+        init_if_needed,
+        payer = signer,
+        associated_token::mint = nft_mint,
+        associated_token::authority = signer
+    )]
+    pub buyer_nft_token: Account<'info, TokenAccount>,
+
     pub token_program: Program<'info, Token>,
+    pub associated_token_program: Program<'info, AssociatedToken>,
+    pub metadata_program: Program<'info, Metadata>,
     pub system_program: Program<'info, System>,
+    pub rent: Sysvar<'info, Rent>,
 }
 
 #[derive(Accounts)]
@@ -402,10 +588,7 @@ pub struct RebuyPixel<'info> {
     #[account(mut)]
     pub signer: Signer<'info>,
 
-    #[account(
-        mut,
-        token::authority = signer
-    )]
+    #[account(mut, token::authority = signer)]
     pub buyer_usdc: Account<'info, TokenAccount>,
 
     #[account(mut)]
@@ -416,7 +599,26 @@ pub struct RebuyPixel<'info> {
 
     pub usdc_mint: Account<'info, Mint>,
 
+    /// Mint du NFT de ce pixel
+    #[account(mut)]
+    pub nft_mint: Account<'info, Mint>,
+
+    /// Compte token NFT du vendeur (doit avoir pre-approuvé le billboard PDA comme delegate)
+    #[account(mut)]
+    pub seller_nft_token: Account<'info, TokenAccount>,
+
+    /// ATA de l'acheteur pour le NFT (créé si inexistant)
+    #[account(
+        init_if_needed,
+        payer = signer,
+        associated_token::mint = nft_mint,
+        associated_token::authority = signer
+    )]
+    pub buyer_nft_token: Account<'info, TokenAccount>,
+
     pub token_program: Program<'info, Token>,
+    pub associated_token_program: Program<'info, AssociatedToken>,
+    pub system_program: Program<'info, System>,
 }
 
 #[derive(Accounts)]
@@ -454,6 +656,18 @@ pub struct LockPixel<'info> {
     )]
     pub owner_block_token: Account<'info, TokenAccount>,
 
+    /// Mint du NFT de ce pixel (la freeze_authority est le PDA billboard)
+    #[account(mut)]
+    pub nft_mint: Account<'info, Mint>,
+
+    /// Compte token NFT du propriétaire (sera gelé irréversiblement)
+    #[account(
+        mut,
+        constraint = owner_nft_token.owner == owner.key() @ ErrorCode::InvalidNftTokenOwner,
+        constraint = owner_nft_token.mint == nft_mint.key() @ ErrorCode::InvalidNftMint
+    )]
+    pub owner_nft_token: Account<'info, TokenAccount>,
+
     pub token_program: Program<'info, Token>,
 }
 
@@ -473,6 +687,10 @@ pub struct UpdateMetadata<'info> {
     )]
     pub pixel: Account<'info, PixelAccount>,
 }
+
+// ─────────────────────────────────────────────
+// DATA ACCOUNTS
+// ─────────────────────────────────────────────
 
 #[account]
 pub struct BillboardAccount {
@@ -524,6 +742,10 @@ impl PixelAccount {
         1;
 }
 
+// ─────────────────────────────────────────────
+// ERROR CODES
+// ─────────────────────────────────────────────
+
 #[error_code]
 pub enum ErrorCode {
     #[msg("Invalid coordinate. Must be between 0 and 999.")]
@@ -562,4 +784,8 @@ pub enum ErrorCode {
     InvalidBlockTokenOwner,
     #[msg("Insufficient BLOCK balance.")]
     InsufficientBlockBalance,
+    #[msg("Invalid NFT mint.")]
+    InvalidNftMint,
+    #[msg("Invalid NFT token account owner.")]
+    InvalidNftTokenOwner,
 }
