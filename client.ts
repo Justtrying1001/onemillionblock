@@ -28,7 +28,9 @@ const toNum = (value: any): number => {
   return Number(value);
 };
 
-const getTokenBalanceRaw = async (address: anchor.web3.PublicKey): Promise<bigint> => {
+const getTokenBalanceRaw = async (
+  address: anchor.web3.PublicKey
+): Promise<bigint> => {
   const account = await getAccount(provider.connection, address);
   return account.amount;
 };
@@ -155,7 +157,11 @@ const run = async () => {
   );
 
   // 3) Init billboard si besoin (blockMint en block token mint)
+  let billboardState: any;
   try {
+    billboardState = await program.account.billboardAccount.fetch(billboardPda);
+    console.log("Billboard déjà initialisé:", billboardPda.toBase58());
+  } catch (e) {
     const initTx = await program.methods
       .initializeBillboard(buyerWallet, buyerWallet, blockMint)
       .accountsStrict({
@@ -166,8 +172,13 @@ const run = async () => {
       .rpc();
 
     console.log("Initialize billboard tx:", initTx);
-  } catch (e) {
-    console.log("Billboard probablement déjà initialisé, on continue...");
+    billboardState = await program.account.billboardAccount.fetch(billboardPda);
+  }
+
+  if (billboardState.blockTokenMint.toBase58() !== blockMint.toBase58()) {
+    throw new Error(
+      `Billboard block_token_mint incompatible. Expected ${blockMint.toBase58()}, got ${billboardState.blockTokenMint.toBase58()}`
+    );
   }
 
   // 4) Seller wallet
@@ -210,8 +221,10 @@ const run = async () => {
   await logTokenBalance("Buyer BLOCK before lock", buyerBlock);
 
   // 7) Pixel fresh
-  const x = 52;
-  const y = 19;
+  const seed = Date.now();
+  const x = seed % 1000;
+  const y = Math.floor(seed / 1000) % 1000;
+  console.log("Test coordinates:", { x, y });
 
   const [pixelPda] = anchor.web3.PublicKey.findProgramAddressSync(
     [
@@ -387,14 +400,33 @@ const run = async () => {
     throw new Error("Update metadata failed: url mismatch");
   }
 
-  if (Buffer.from(pixelAfterUpdate.imageData).toString("hex") !== newImageData.toString("hex")) {
+  if (
+    Buffer.from(pixelAfterUpdate.imageData).toString("hex") !==
+    newImageData.toString("hex")
+  ) {
     throw new Error("Update metadata failed: imageData mismatch");
+  }
+
+  if (pixelAfterUpdate.owner.toBase58() !== pixelAfterLock.owner.toBase58()) {
+    throw new Error("Update metadata failed: owner changed");
+  }
+
+  if (pixelAfterUpdate.locked !== true) {
+    throw new Error("Update metadata failed: locked should remain true");
+  }
+
+  if (toNum(pixelAfterUpdate.currentPrice) !== toNum(pixelAfterLock.currentPrice)) {
+    throw new Error("Update metadata failed: currentPrice changed");
+  }
+
+  if (toNum(pixelAfterUpdate.rebuyCount) !== toNum(pixelAfterLock.rebuyCount)) {
+    throw new Error("Update metadata failed: rebuyCount changed");
   }
 
   console.log("E2E script completed successfully ✅");
 };
 
 run().catch((err) => {
-  console.error(err);
-  process.exit(1);
+  console.error("Uncaught error:", err);
+  throw err;
 });
